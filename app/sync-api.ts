@@ -50,6 +50,17 @@ export type GitHubSettingsResult = {
   };
 };
 
+export type BookSearchResult = {
+  id: string;
+  title: string;
+  authors: string[];
+  publisher: string | null;
+  pageCount: number | null;
+  coverUrl: string | null;
+  sourceUrl: string;
+  isbn: string | null;
+};
+
 export const syncApi = {
   status: () => apiRequest<{ setupRequired: boolean }>("/api/auth/status"),
   register: (username: string, password: string, setupCode: string) => apiRequest<AuthResult>("/api/auth/register", { method: "POST", body: JSON.stringify({ username, password, setupCode }) }),
@@ -61,4 +72,7 @@ export const syncApi = {
   getGitHubSettings: (token: string) => apiRequest<GitHubSettingsResult>("/api/github/config", {}, token),
   saveGitHubSettings: (token: string, settings: { owner: string; repo: string; branch: string; path: string; token?: string }) => apiRequest<{ ok: true }>("/api/github/config", { method: "PUT", body: JSON.stringify(settings) }, token),
   backupNow: (token: string) => apiRequest<{ ok: true }>("/api/github/sync", { method: "POST" }, token),
+  getReading: <T>(token: string) => apiRequest<DataResult<T>>("/api/reading", {}, token),
+  putReading: <T>(token: string, data: T, baseVersion: number) => apiRequest<DataResult<T>>("/api/reading", { method: "PUT", body: JSON.stringify({ data, baseVersion }) }, token),
+  searchBooks: (token: string, query: string) => apiRequest<{ books: BookSearchResult[]; source: string }>(`/api/books/search?q=${encodeURIComponent(query)}`, {}, token),
 };

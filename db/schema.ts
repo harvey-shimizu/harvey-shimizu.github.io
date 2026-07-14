@@ -25,6 +25,13 @@ export const trackerState = sqliteTable("tracker_state", {
   updatedAt: text("updated_at").notNull(),
 });
 
+export const readingState = sqliteTable("reading_state", {
+  userId: text("user_id").primaryKey(),
+  dataJson: text("data_json").notNull(),
+  version: integer("version").notNull().default(1),
+  updatedAt: text("updated_at").notNull(),
+});
+
 export const githubSettings = sqliteTable("github_settings", {
   userId: text("user_id").primaryKey(),
   owner: text("owner").notNull(),

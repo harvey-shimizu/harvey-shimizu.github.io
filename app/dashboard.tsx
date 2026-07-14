@@ -7,7 +7,6 @@ import {
   ReactNode,
   useCallback,
   useEffect,
-  useMemo,
   useRef,
   useState,
 } from "react";
@@ -40,8 +39,13 @@ type TrackerStore = {
   steps: Record<string, number>;
   recoveries: Record<string, string[]>;
   notes: Record<string, string>;
+  customTasks: Record<string, PlanTask[]>;
+  taskOverrides: Record<string, TaskOverride>;
   modified: Record<string, number>;
 };
+
+type TaskOverride = Partial<Pick<PlanTask, "title" | "detail" | "minutes" | "category" | "tag">> & { deleted?: boolean };
+type TaskEditorState = { mode: "new" | "edit"; task?: PlanTask };
 
 type SyncStatus = {
   state: "off" | "idle" | "syncing" | "success" | "error";
@@ -91,6 +95,8 @@ const emptyStore: TrackerStore = {
   steps: {},
   recoveries: {},
   notes: {},
+  customTasks: {},
+  taskOverrides: {},
   modified: {},
 };
 
@@ -101,6 +107,8 @@ function normalizeStore(value?: Partial<TrackerStore> | null): TrackerStore {
     steps: value?.steps ?? {},
     recoveries: value?.recoveries ?? {},
     notes: value?.notes ?? {},
+    customTasks: value?.customTasks ?? {},
+    taskOverrides: value?.taskOverrides ?? {},
     modified: value?.modified ?? {},
   };
 }
@@ -113,6 +121,8 @@ function stampStore(value: Partial<TrackerStore>) {
   Object.keys(store.steps).forEach((key) => { modified[`steps:${key}`] = now; });
   Object.keys(store.recoveries).forEach((key) => { modified[`recoveries:${key}`] = now; });
   Object.keys(store.notes).forEach((key) => { modified[`notes:${key}`] = now; });
+  Object.keys(store.customTasks).forEach((key) => { modified[`customTasks:${key}`] = now; });
+  Object.keys(store.taskOverrides).forEach((key) => { modified[`taskOverrides:${key}`] = now; });
   return { ...store, modified };
 }
 
@@ -152,6 +162,8 @@ function mergeStores(localValue: Partial<TrackerStore>, remoteValue: Partial<Tra
     steps: mergeRecord("steps", local.steps, remote.steps, local.modified, remote.modified, (a, b) => Math.max(a ?? 0, b ?? 0)),
     recoveries: mergeRecord("recoveries", local.recoveries, remote.recoveries, local.modified, remote.modified, (a, b) => Array.from(new Set([...(a ?? []), ...(b ?? [])]))),
     notes: mergeRecord("notes", local.notes, remote.notes, local.modified, remote.modified, (a, b) => b ?? a ?? ""),
+    customTasks: mergeRecord("customTasks", local.customTasks, remote.customTasks, local.modified, remote.modified, (a, b) => b ?? a ?? []),
+    taskOverrides: mergeRecord("taskOverrides", local.taskOverrides, remote.taskOverrides, local.modified, remote.modified, (a, b) => b ?? a ?? {}),
     modified,
   } satisfies TrackerStore;
 }
@@ -159,6 +171,7 @@ function mergeStores(localValue: Partial<TrackerStore>, remoteValue: Partial<Tra
 
 const navItems: { id: string; label: string; icon: IconName }[] = [
   { id: "dashboard", label: "ダッシュボード", icon: "grid" },
+  { id: "reading", label: "読書アーカイブ", icon: "book" },
   { id: "curriculum", label: "カリキュラム", icon: "book" },
   { id: "tasks", label: "タスク", icon: "check" },
   { id: "progress", label: "進捗レポート", icon: "chart" },
@@ -246,6 +259,7 @@ export default function Dashboard() {
   const [syncStatus, setSyncStatus] = useState<SyncStatus>({ state: "off", message: "ログイン待ち" });
   const [githubSettings, setGithubSettings] = useState<GitHubSettingsResult | null>(null);
   const [showToken, setShowToken] = useState(false);
+  const [taskEditor, setTaskEditor] = useState<TaskEditorState | null>(null);
   const fileRef = useRef<HTMLInputElement>(null);
   const syncLock = useRef(false);
   const lastSyncedFingerprint = useRef("");
@@ -407,7 +421,12 @@ export default function Dashboard() {
   const phase = planMonthFor(selectedDate);
   const hanon = phaseForDate(selectedDate);
   const strength = strengthTarget(selectedDate);
-  const selectedTasks = useMemo(() => tasksForDate(selectedDate), [selectedDate]);
+  function tasksForDisplay(iso: string) {
+    return [...tasksForDate(iso), ...(store.customTasks[iso] ?? [])]
+      .map((task) => ({ ...task, ...(store.taskOverrides[task.key] ?? {}) }))
+      .filter((task) => !store.taskOverrides[task.key]?.deleted) as PlanTask[];
+  }
+  const selectedTasks = tasksForDisplay(selectedDate);
   const selectedWeekStart = weekStart(selectedDate);
   const selectedWeekEnd = weekEnd(selectedDate);
   const saturday = addDays(selectedWeekStart, 5);
@@ -420,7 +439,7 @@ export default function Dashboard() {
   }
 
   function expectedKeys(iso: string) {
-    const keys = tasksForDate(iso).map((task) => task.key);
+    const keys = tasksForDisplay(iso).map((task) => task.key);
     keys.push(`${iso}:plank`, `${iso}:pushup`, `${iso}:squat`);
     if (new Date(`${iso}T00:00:00Z`).getUTCDay() === 6) keys.push(`walk:${weekStart(iso)}`);
     return keys;
@@ -453,14 +472,14 @@ export default function Dashboard() {
 
   const assignedRecovery = store.recoveries[selectedDate] ?? [];
   const assignedTasks = assignedRecovery
-    .map((key) => tasksForDate(key.slice(0, 10)).find((task) => task.key === key))
+    .map((key) => tasksForDisplay(key.slice(0, 10)).find((task) => task.key === key))
     .filter((task): task is PlanTask => Boolean(task) && !store.completed[task!.key]);
 
   const recoveryQueue = (() => {
     const reference = selectedDate < today ? selectedDate : today;
     const start = addDays(reference, showAllRecovery ? -30 : -7);
     return dateRange(start < PLAN_START ? PLAN_START : start, addDays(reference, -1))
-      .flatMap((iso) => tasksForDate(iso))
+      .flatMap((iso) => tasksForDisplay(iso))
       .filter((task) => !store.completed[task.key])
       .reverse();
   })();
@@ -497,7 +516,36 @@ export default function Dashboard() {
     }));
   }
 
+  function saveTask(values: Pick<PlanTask, "title" | "detail" | "minutes" | "category" | "tag">) {
+    setStore((current) => {
+      const now = Date.now();
+      if (taskEditor?.mode === "edit" && taskEditor.task) {
+        const task = taskEditor.task;
+        if (task.key.includes(":custom:")) {
+          return { ...current, customTasks: { ...current.customTasks, [selectedDate]: (current.customTasks[selectedDate] ?? []).map((item) => item.key === task.key ? { ...item, ...values } : item) }, modified: { ...current.modified, [`customTasks:${selectedDate}`]: now } };
+        }
+        return { ...current, taskOverrides: { ...current.taskOverrides, [task.key]: { ...(current.taskOverrides[task.key] ?? {}), ...values, deleted: false } }, modified: { ...current.modified, [`taskOverrides:${task.key}`]: now } };
+      }
+      const id = crypto.randomUUID();
+      const task: PlanTask = { id: `custom-${id}`, key: `${selectedDate}:custom:${id}`, ...values };
+      return { ...current, customTasks: { ...current.customTasks, [selectedDate]: [...(current.customTasks[selectedDate] ?? []), task] }, modified: { ...current.modified, [`customTasks:${selectedDate}`]: now } };
+    });
+    setTaskEditor(null);
+    setToast(taskEditor?.mode === "edit" ? "タスクを更新しました" : "タスクを追加しました");
+  }
+
+  function deleteTask(task: PlanTask) {
+    setStore((current) => {
+      const now = Date.now();
+      if (task.key.includes(":custom:")) return { ...current, customTasks: { ...current.customTasks, [selectedDate]: (current.customTasks[selectedDate] ?? []).filter((item) => item.key !== task.key) }, modified: { ...current.modified, [`customTasks:${selectedDate}`]: now } };
+      return { ...current, taskOverrides: { ...current.taskOverrides, [task.key]: { ...(current.taskOverrides[task.key] ?? {}), deleted: true } }, modified: { ...current.modified, [`taskOverrides:${task.key}`]: now } };
+    });
+    setTaskEditor(null);
+    setToast("タスクを削除し、達成率を再集計しました");
+  }
+
   function goToSection(id: string) {
+    if (id === "reading") { window.location.assign("/reading/"); return; }
     setActiveSection(id);
     document.getElementById(id)?.scrollIntoView({ behavior: "smooth", block: "start" });
   }
@@ -606,10 +654,10 @@ export default function Dashboard() {
 
         <div className="primary-grid">
           <section className="panel tasks-panel" id="tasks">
-            <div className="panel-heading"><div><h2>今日のタスク <span>{selectedTasks.length + assignedTasks.length}</span></h2><p>標準 {dailyMinutes}分・最低実行ライン30分</p></div><div className="day-score"><strong>{selectedDayMetric.percent}%</strong><span>本日</span></div></div>
+            <div className="panel-heading"><div><h2>今日のタスク <span>{selectedTasks.length + assignedTasks.length}</span></h2><p>標準 {dailyMinutes}分・追加／編集内容も達成率へ自動反映</p></div><div className="task-heading-actions"><button type="button" className="add-task-button" onClick={() => setTaskEditor({ mode: "new" })}>＋ タスクを追加</button><div className="day-score"><strong>{selectedDayMetric.percent}%</strong><span>本日</span></div></div></div>
             {assignedTasks.length > 0 && <div className="recovery-assigned"><span>RECOVERY</span>{assignedTasks.map((task) => <TaskRow key={`assigned-${task.key}`} task={task} checked={Boolean(store.completed[task.key])} onToggle={() => toggleCompletion(task.key)} recovered onRemove={() => removeRecovery(task.key)} />)}</div>}
             <div className="task-list">
-              {selectedTasks.map((task) => <TaskRow key={task.key} task={task} checked={Boolean(store.completed[task.key])} onToggle={() => toggleCompletion(task.key)} />)}
+              {selectedTasks.map((task) => <TaskRow key={task.key} task={task} checked={Boolean(store.completed[task.key])} onToggle={() => toggleCompletion(task.key)} onEdit={() => setTaskEditor({ mode: "edit", task })} />)}
             </div>
             <label className="daily-note"><span>今日のひと言メモ</span><textarea id="daily-note" value={store.notes[selectedDate] ?? ""} placeholder="できたこと、詰まった点、明日の一手…" onChange={(event) => setStore((current) => ({ ...current, notes: { ...current.notes, [selectedDate]: event.target.value }, modified: { ...current.modified, [`notes:${selectedDate}`]: Date.now() } }))} /></label>
           </section>
@@ -663,7 +711,9 @@ export default function Dashboard() {
             {milestones.map((milestone, index) => {
               const key = `milestone:${milestone.id}`;
               const checked = Boolean(store.completed[key]);
-              return <article key={milestone.id} className={checked ? "complete" : ""}><div className="milestone-index">{String(index + 1).padStart(2, "0")}</div><div><span>{shortDate(milestone.date)}</span><strong>{milestone.name}</strong><p>{milestone.target}</p></div><TaskCheckbox checked={checked} onChange={() => toggleCompletion(key)} label={milestone.name} /></article>;
+              const examPassed = milestone.date < today && !checked;
+              const deadlinePassed = Boolean(milestone.applicationDeadline && milestone.applicationDeadline < today && !checked);
+              return <article key={milestone.id} className={`${checked ? "complete" : ""} ${examPassed || deadlinePassed ? "schedule-alert" : ""}`}><div className="milestone-index">{String(index + 1).padStart(2, "0")}</div><div><span>試験目標 {shortDate(milestone.date)}</span><strong>{milestone.name}</strong><p>{milestone.target}</p><div className="application-date"><em>{milestone.applicationDeadline ? `申込管理期限 ${shortDate(milestone.applicationDeadline)}` : "申込締切：会場ごと"}</em>{examPassed ? <b>受験日経過・次回日程を確認</b> : deadlinePassed ? <b>期限経過・公式日程を確認</b> : <small>{milestone.applicationNote}</small>}{milestone.scheduleUrl.startsWith("http") && <a href={milestone.scheduleUrl} target="_blank" rel="noreferrer">公式日程 ↗</a>}</div></div><TaskCheckbox checked={checked} onChange={() => toggleCompletion(key)} label={milestone.name} /></article>;
             })}
           </div>
         </section>
@@ -672,10 +722,12 @@ export default function Dashboard() {
       </main>
 
       <nav className="mobile-nav" aria-label="モバイルナビゲーション">
-        {[navItems[0], navItems[2], navItems[3], navItems[5], navItems[6]].map((item) => <button key={item.id} type="button" className={activeSection === item.id ? "active" : ""} onClick={() => goToSection(item.id)}><Icon name={item.icon} /><span>{item.label.replace("トラッカー", "").replace("レポート", "")}</span></button>)}
+        {["dashboard", "reading", "tasks", "habits", "recovery"].map((id) => navItems.find((item) => item.id === id)!).map((item) => <button key={item.id} type="button" className={activeSection === item.id ? "active" : ""} onClick={() => goToSection(item.id)}><Icon name={item.icon} /><span>{item.label.replace("トラッカー", "").replace("レポート", "").replace("アーカイブ", "")}</span></button>)}
       </nav>
 
       {dataModal && <div className="modal-backdrop" role="presentation" onMouseDown={() => setDataModal(false)}><section className="data-modal" role="dialog" aria-modal="true" aria-labelledby="data-modal-title" onMouseDown={(event) => event.stopPropagation()}><button className="modal-close" type="button" aria-label="閉じる" onClick={() => setDataModal(false)}><Icon name="close" /></button><span className="eyebrow">DATA VAULT</span><h2 id="data-modal-title">記録データの管理</h2><p>記録はログイン中のクラウドへ自動保存され、Mac・Windows・iPhoneで同じ最新データを利用できます。ブラウザ内にも復旧用キャッシュを保持します。</p><div className="cloud-summary"><Icon name="shield" /><div><strong>{auth.username} として保護中</strong><span>{syncStatus.message}{syncStatus.lastSyncAt ? `・${new Date(syncStatus.lastSyncAt).toLocaleTimeString("ja-JP", { hour: "2-digit", minute: "2-digit" })}` : ""}</span></div><AppButton icon="cloud" onClick={() => void uploadCloud(true)}>今すぐ同期</AppButton></div><GitHubBackupPanel token={sessionToken} initial={githubSettings} showToken={showToken} onToggleToken={() => setShowToken((value) => !value)} onUpdated={async () => setGithubSettings(await syncApi.getGitHubSettings(sessionToken))} onToast={setToast} /><div className="local-backup"><strong>手元にもバックアップ</strong><p>JSONは緊急時の持ち出し・復元用です。読み込んだ内容はクラウドにも反映されます。</p><div className="modal-actions"><AppButton icon="download" variant="primary" onClick={exportData}>JSONを書き出す</AppButton><AppButton icon="upload" onClick={() => fileRef.current?.click()}>JSONを読み込む</AppButton><input ref={fileRef} type="file" accept="application/json,.json" onChange={importData} hidden /><AppButton icon="copy" variant="ghost" onClick={copyReport}>進捗サマリーをコピー</AppButton></div></div><button className="logout-button" type="button" onClick={() => void logout()}>この端末からログアウト</button></section></div>}
+
+      {taskEditor && <TaskEditorModal state={taskEditor} date={selectedDate} onClose={() => setTaskEditor(null)} onSave={saveTask} onDelete={taskEditor.mode === "edit" && taskEditor.task ? () => deleteTask(taskEditor.task!) : undefined} />}
 
       {toast && <div className="toast" role="status" aria-live="polite">{toast}</div>}
     </div>
@@ -760,8 +812,24 @@ function GitHubBackupPanel({ token, initial, showToken, onToggleToken, onUpdated
   return <form className="github-backup" onSubmit={save}><div className="github-heading"><div><span className="eyebrow">OPTIONAL DOUBLE BACKUP</span><strong>GitHubにも暗号化キー経由で保存</strong><small>{initial?.configured ? current?.last_backup_error ? `要確認：${current.last_backup_error}` : current?.last_backup_at ? `最終バックアップ ${new Date(current.last_backup_at).toLocaleString("ja-JP")}` : "設定済み・初回保存待ち" : "未設定"}</small></div><StatusPill tone={initial?.configured && !current?.last_backup_error ? "green" : "neutral"}>{initial?.configured ? "CONNECTED" : "OPTIONAL"}</StatusPill></div><div className="github-grid"><label><span>OWNER</span><input value={owner} onChange={(event) => setOwner(event.target.value)} required /></label><label><span>PRIVATE REPOSITORY</span><input value={repo} onChange={(event) => setRepo(event.target.value)} required /></label><label><span>BRANCH</span><input value={branch} onChange={(event) => setBranch(event.target.value)} required /></label><label><span>FILE PATH</span><input value={path} onChange={(event) => setPath(event.target.value)} required /></label></div><label className="github-token"><span>Fine-grained access token {initial?.configured && "（変更時のみ）"}</span><div><input type={showToken ? "text" : "password"} value={githubToken} onChange={(event) => setGithubToken(event.target.value)} placeholder={initial?.configured ? "保存済み" : "github_pat_…"} required={!initial?.configured} /><button type="button" onClick={onToggleToken}>{showToken ? "隠す" : "表示"}</button></div><small>専用の非公開リポジトリに対する Contents: Read and write のみを付与。保存キーはサーバー側で暗号化します。</small></label><div className="github-actions"><AppButton icon="key" variant="primary" type="submit" disabled={busy}>{busy ? "処理中…" : "設定を保存"}</AppButton>{initial?.configured && <AppButton icon="cloud" onClick={() => void backup()} disabled={busy}>今すぐGitHubへ保存</AppButton>}</div></form>;
 }
 
-function TaskRow({ task, checked, onToggle, recovered = false, onRemove }: { task: PlanTask; checked: boolean; onToggle: () => void; recovered?: boolean; onRemove?: () => void }) {
-  return <div className={`task-row ${checked ? "complete" : ""}`}><TaskCheckbox checked={checked} onChange={onToggle} label={task.title} /><div className="task-copy"><strong>{task.title}</strong><span>{task.detail}</span></div><StatusPill tone={task.category === "hanon" ? "red" : task.category === "output" ? "green" : task.category === "review" ? "amber" : "neutral"}>{recovered ? "RECOVERY" : task.tag}</StatusPill><span className="task-minutes">{task.minutes}<small>min</small></span>{onRemove ? <button type="button" className="remove-task" onClick={onRemove} aria-label="リカバリーから外す"><Icon name="close" size={16} /></button> : <Icon name="arrow" size={17} />}</div>;
+function TaskEditorModal({ state, date, onClose, onSave, onDelete }: { state: TaskEditorState; date: string; onClose: () => void; onSave: (values: Pick<PlanTask, "title" | "detail" | "minutes" | "category" | "tag">) => void; onDelete?: () => void }) {
+  const task = state.task;
+  const [title, setTitle] = useState(task?.title ?? "");
+  const [detail, setDetail] = useState(task?.detail ?? "");
+  const [minutes, setMinutes] = useState(task?.minutes ?? 15);
+  const [category, setCategory] = useState<PlanTask["category"]>(task?.category ?? "review");
+  const [tag, setTag] = useState(task?.tag ?? "CUSTOM");
+
+  function submit(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    onSave({ title: title.trim(), detail: detail.trim(), minutes: Math.min(480, Math.max(1, minutes)), category, tag: tag.trim() || "CUSTOM" });
+  }
+
+  return <div className="modal-backdrop" role="presentation" onMouseDown={onClose}><form className="task-editor-modal" onSubmit={submit} onMouseDown={(event) => event.stopPropagation()}><button className="modal-close" type="button" aria-label="閉じる" onClick={onClose}><Icon name="close" /></button><span className="eyebrow">TASK DESIGN / {shortDate(date)}</span><h2>{state.mode === "new" ? "タスクを追加" : "タスクを編集"}</h2><p>保存後、この日のタスク数・達成率・週月集計が自動的に再計算されます。</p><label><span>タスク名</span><input value={title} onChange={(event) => setTitle(event.target.value)} required maxLength={80} placeholder="例：英語記事を1本読む" /></label><label><span>内容・達成条件</span><textarea value={detail} onChange={(event) => setDetail(event.target.value)} maxLength={240} placeholder="何をすれば完了かを具体的に" /></label><div className="task-editor-grid"><label><span>目安時間（分）</span><input type="number" min="1" max="480" value={minutes} onChange={(event) => setMinutes(Number(event.target.value))} required /></label><label><span>分類</span><select value={category} onChange={(event) => setCategory(event.target.value as PlanTask["category"])}><option value="hanon">Hanon</option><option value="reading">Reading</option><option value="exam">Exam / TOEIC</option><option value="output">Business Output</option><option value="review">Other / Review</option></select></label><label><span>タグ</span><input value={tag} onChange={(event) => setTag(event.target.value)} maxLength={18} /></label></div><div className="task-editor-actions">{onDelete && <button type="button" className="delete-task-button" onClick={() => { if (window.confirm("このタスクを削除しますか？達成率も再計算されます。")) onDelete(); }}>削除</button>}<button type="button" className="cancel-task-button" onClick={onClose}>キャンセル</button><button type="submit" className="save-task-button">{state.mode === "new" ? "追加して再集計" : "変更を保存"}</button></div></form></div>;
+}
+
+function TaskRow({ task, checked, onToggle, recovered = false, onRemove, onEdit }: { task: PlanTask; checked: boolean; onToggle: () => void; recovered?: boolean; onRemove?: () => void; onEdit?: () => void }) {
+  return <div className={`task-row ${checked ? "complete" : ""}`}><TaskCheckbox checked={checked} onChange={onToggle} label={task.title} /><div className="task-copy"><strong>{task.title}</strong><span>{task.detail}</span></div><StatusPill tone={task.category === "hanon" ? "red" : task.category === "reading" || task.category === "output" ? "green" : task.category === "review" ? "amber" : "neutral"}>{recovered ? "RECOVERY" : task.tag}</StatusPill><span className="task-minutes">{task.minutes}<small>min</small></span><div className="task-row-actions">{onEdit && <button type="button" onClick={onEdit} aria-label={`${task.title}を編集`}><Icon name="edit" size={15} /></button>}{onRemove ? <button type="button" onClick={onRemove} aria-label="リカバリーから外す"><Icon name="close" size={16} /></button> : task.category === "reading" ? <a href="/reading/" aria-label="読書ページを開く"><Icon name="arrow" size={17} /></a> : <Icon name="arrow" size={17} />}</div></div>;
 }
 
 function HabitRow({ icon, title, detail, checked, onToggle }: { icon: IconName; title: string; detail: string; checked: boolean; onToggle: () => void }) {

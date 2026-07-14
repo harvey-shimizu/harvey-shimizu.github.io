@@ -2,7 +2,7 @@ export const PLAN_START = "2026-07-15";
 export const PLAN_END = "2028-01-14";
 export const WALK_TARGET = 10_000;
 
-export type TaskCategory = "hanon" | "exam" | "output" | "review";
+export type TaskCategory = "hanon" | "reading" | "exam" | "output" | "review";
 
 export type PlanTask = {
   id: string;
@@ -28,6 +28,9 @@ export type Milestone = {
   date: string;
   name: string;
   target: string;
+  applicationDeadline?: string;
+  applicationNote: string;
+  scheduleUrl: string;
 };
 
 export const phases: PlanPhase[] = [
@@ -52,13 +55,13 @@ export const phases: PlanPhase[] = [
 ];
 
 export const milestones: Milestone[] = [
-  { id: "sw-1", date: "2026-09-27", name: "TOEIC Speaking & Writing", target: "S160 / W150" },
-  { id: "sw-2", date: "2027-01-24", name: "TOEIC Speaking & Writing", target: "S180 / W180" },
-  { id: "linguaskill", date: "2027-03-21", name: "Linguaskill Business", target: "C1 / 180+" },
-  { id: "toeic-lr", date: "2027-04-25", name: "TOEIC L&R", target: "900+（945 stretch）" },
-  { id: "c1", date: "2027-08-22", name: "C1 Advanced", target: "193+ / Grade B" },
-  { id: "ielts", date: "2027-12-12", name: "IELTS General Training", target: "Overall 7.5 / 各7.0+" },
-  { id: "pack", date: "2028-01-14", name: "Global Career Evidence Pack", target: "CV・STAR・推薦状・証明書" },
+  { id: "sw-1", date: "2026-09-27", name: "TOEIC Speaking & Writing", target: "S160 / W150", applicationDeadline: "2026-08-14", applicationNote: "計画上の安全期限。公式申込期間を要確認", scheduleUrl: "https://www.iibc-global.org/toeic/test/sw/guide01.html" },
+  { id: "sw-2", date: "2027-01-24", name: "TOEIC Speaking & Writing", target: "S180 / W180", applicationDeadline: "2026-12-18", applicationNote: "計画上の安全期限。公式申込期間を要確認", scheduleUrl: "https://www.iibc-global.org/toeic/test/sw/guide01.html" },
+  { id: "linguaskill", date: "2027-03-21", name: "Linguaskill Business", target: "C1 / 180+", applicationNote: "認定会場ごとの随時実施・締切", scheduleUrl: "https://www.cambridgeenglish.org/exams-and-tests/linguaskill/find-a-centre/" },
+  { id: "toeic-lr", date: "2027-04-25", name: "TOEIC L&R", target: "900+（945 stretch）", applicationDeadline: "2027-03-12", applicationNote: "計画上の安全期限。公式申込期間を要確認", scheduleUrl: "https://www.iibc-global.org/toeic/test/lr/guide01.html" },
+  { id: "c1", date: "2027-08-22", name: "C1 Advanced", target: "193+ / Grade B", applicationDeadline: "2027-06-25", applicationNote: "会場別締切に備えた安全期限", scheduleUrl: "https://www.cambridgeenglish.org/find-a-centre/find-an-exam-centre/" },
+  { id: "ielts", date: "2027-12-12", name: "IELTS General Training", target: "Overall 7.5 / 各7.0+", applicationDeadline: "2027-11-12", applicationNote: "満席前に確保するための安全期限", scheduleUrl: "https://ielts.org/take-a-test/book-a-test" },
+  { id: "pack", date: "2028-01-14", name: "Global Career Evidence Pack", target: "CV・STAR・推薦状・証明書", applicationNote: "申込不要", scheduleUrl: "#resources" },
 ];
 
 export function parseISO(iso: string) {
@@ -145,31 +148,20 @@ export function strengthTarget(iso: string) {
   return 30;
 }
 
-const weekdaySkills = [
-  "週次レビュー・弱点の再設計",
-  "Listening：要点把握とシャドーイング",
-  "Reading：速読と論理構造",
-  "Speaking：3分プレゼンと即答",
-  "Writing：Executive Memo",
-  "統合演習：時間制限付きセット",
-  "フル模試／セクション模試",
-];
-
-const outputByDay = [
-  "翌週の会議・面接で使う表現を10本準備",
-  "英語ニュースを100語で要約",
-  "STAR回答を1本、声に出して録音",
-  "3分プレゼンを録音して自己採点",
-  "Executive Memoを150〜250語で作成",
-  "今週の成果を英語で上司向けに要約",
-  "模試の誤答を英語で説明",
+const weekendEnglish = [
+  "I’d like to clarify the decision criteria before we proceed.",
+  "The key issue is not speed, but whether the change is sustainable.",
+  "Could you walk me through the assumptions behind this estimate?",
+  "My recommendation is to start small, measure the impact, and scale deliberately.",
+  "Let me summarize the trade-offs and propose a practical next step.",
+  "We should distinguish what is urgent from what is strategically important.",
 ];
 
 function examDetail(month: number, day: number) {
   const phase = phases[month - 1];
   if (day === 6) return `${phase.credential}：時間制限付き模試と採点`;
   if (day === 0) return `${phase.credential}：誤答ログと弱点トップ3の修正`;
-  return `${phase.credential}｜${weekdaySkills[day]}`;
+  return `${phase.credential}：週末の重点項目を復習`;
 }
 
 export function tasksForDate(iso: string): PlanTask[] {
@@ -180,38 +172,23 @@ export function tasksForDate(iso: string): PlanTask[] {
   const hanon = phaseForDate(iso);
   const saturday = day === 6;
   const sunday = day === 0;
+  const week = Math.max(0, Math.floor(diffDays(PLAN_START, iso) / 7));
+  const sentence = weekendEnglish[week % weekendEnglish.length];
+  const core: PlanTask[] = [
+    { id: "hanon", key: `${iso}:hanon`, title: hanon.name, detail: `${hanon.tag}｜${saturday || sunday ? "通し練習と録音比較" : "口が止まった箇所を3周して録音"}`, minutes: saturday ? 60 : sunday ? 45 : 45, category: "hanon", tag: hanon.tag },
+    { id: "reading", key: `${iso}:reading`, title: "Daily Reading", detail: "数ページでOK。現在の本を開き、読んだら読書ページで記録", minutes: 10, category: "reading", tag: "READ" },
+  ];
   const tasks: PlanTask[] = saturday
     ? [
-        { id: "hanon", key: `${iso}:hanon`, title: hanon.name, detail: `${hanon.tag}｜反射速度・音声変化・瞬間応答`, minutes: 60, category: "hanon", tag: hanon.tag },
-        { id: "exam", key: `${iso}:exam`, title: month.credential, detail: examDetail(month.month, day), minutes: 75, category: "exam", tag: `M${month.month}` },
-        { id: "output", key: `${iso}:output`, title: "Business Output", detail: outputByDay[day], minutes: 30, category: "output", tag: "実務転用" },
-        { id: "review", key: `${iso}:review`, title: "誤答・語彙レビュー", detail: "今週の誤りを原因別に分類し、再テスト日を設定", minutes: 15, category: "review", tag: "週次" },
+        ...core,
+        { id: "output", key: `${iso}:output`, title: "Weekend Business Output", detail: `覚えていますか？ 以前の表現を1つ声に出して再利用。おすすめ：${sentence}`, minutes: 20, category: "output", tag: "週末提案" },
       ]
     : sunday
       ? [
-          { id: "hanon", key: `${iso}:hanon`, title: hanon.name, detail: `${hanon.tag}｜通し練習と録音比較`, minutes: 45, category: "hanon", tag: hanon.tag },
-          { id: "exam", key: `${iso}:exam`, title: "Error Log & Recovery", detail: examDetail(month.month, day), minutes: 35, category: "exam", tag: `M${month.month}` },
-          { id: "output", key: `${iso}:output`, title: "Career Evidence", detail: "STAR事例・英語CV・推薦者候補のいずれかを更新", minutes: 25, category: "output", tag: "Career" },
-          { id: "review", key: `${iso}:review`, title: "Weekly Review", detail: "達成率、学習時間、翌週の重点3項目を確定", minutes: 15, category: "review", tag: "週次" },
+          ...core,
+          { id: "exam", key: `${iso}:exam`, title: "Weekend TOEIC Review", detail: `先週学んだこと、まだ覚えていますか？ ${examDetail(month.month, day)}｜例文：${sentence}`, minutes: 30, category: "exam", tag: `M${month.month}` },
         ]
-      : [
-          { id: "hanon", key: `${iso}:hanon`, title: hanon.name, detail: `${hanon.tag}｜口が止まった箇所を3周して録音`, minutes: 45, category: "hanon", tag: hanon.tag },
-          { id: "exam", key: `${iso}:exam`, title: month.credential, detail: examDetail(month.month, day), minutes: 45, category: "exam", tag: `M${month.month}` },
-          { id: "output", key: `${iso}:output`, title: "Business Output", detail: outputByDay[day], minutes: 20, category: "output", tag: "実務転用" },
-          { id: "review", key: `${iso}:review`, title: "語彙・誤答ログ", detail: "重要語10語＋前日の誤りを翌日再テストへ登録", minutes: 10, category: "review", tag: "毎日" },
-        ];
-
-  if (date.getUTCDate() === 14) {
-    tasks.push({
-      id: "monthly",
-      key: `${iso}:monthly`,
-      title: "Monthly Executive Review",
-      detail: "フル模試・3分プレゼン・Executive Memo 250語・STAR/CV更新",
-      minutes: 60,
-      category: "output",
-      tag: "月次",
-    });
-  }
+      : core;
   return tasks;
 }
 

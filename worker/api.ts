@@ -173,11 +173,43 @@ function encodeContent(value: string) {
   return btoa(binary);
 }
 
+function decodeXml(value: string) {
+  return value.replaceAll("&amp;", "&").replaceAll("&lt;", "<").replaceAll("&gt;", ">").replaceAll("&quot;", '"').replaceAll("&#39;", "'").trim();
+}
+
+function xmlField(item: string, tag: string) {
+  const match = item.match(new RegExp(`<${tag}(?:\\s[^>]*)?>(?:<!\\[CDATA\\[)?([\\s\\S]*?)(?:\\]\\]>)?</${tag}>`, "i"));
+  return match ? decodeXml(match[1].replace(/<[^>]+>/g, " ").replace(/\s+/g, " ")) : "";
+}
+
+function parseNdlBooks(xml: string) {
+  return Array.from(xml.matchAll(/<item>([\s\S]*?)<\/item>/gi)).slice(0, 8).map((match) => {
+    const item = match[1];
+    const title = xmlField(item, "dc:title") || xmlField(item, "title");
+    const sourceUrl = xmlField(item, "link") || xmlField(item, "guid");
+    const extent = xmlField(item, "dc:extent");
+    const isbnMatch = item.match(/<dc:identifier[^>]*ISBN[^>]*>([\s\S]*?)<\/dc:identifier>/i);
+    const isbn = isbnMatch ? decodeXml(isbnMatch[1]).replaceAll("-", "") : null;
+    const pageMatch = extent.match(/(\d+)\s*p/i);
+    return {
+      id: sourceUrl || `ndl:${title}`,
+      title,
+      authors: (xmlField(item, "author") || xmlField(item, "dc:creator")).split(/[,、]/).map((value) => value.trim()).filter(Boolean).slice(0, 4),
+      publisher: xmlField(item, "dc:publisher") || null,
+      pageCount: pageMatch ? Number(pageMatch[1]) : null,
+      coverUrl: isbn ? `https://covers.openlibrary.org/b/isbn/${isbn}-M.jpg` : null,
+      sourceUrl,
+      isbn,
+    };
+  }).filter((book) => book.title);
+}
+
 async function backupToGitHub(env: ApiEnv, userId: string) {
   const settings = await env.DB.prepare("SELECT * FROM github_settings WHERE user_id = ?").bind(userId).first<GitHubRow>();
   if (!settings) return;
   const state = await env.DB.prepare("SELECT data_json, version, updated_at FROM tracker_state WHERE user_id = ?").bind(userId).first<{ data_json: string; version: number; updated_at: string }>();
   if (!state) return;
+  const reading = await env.DB.prepare("SELECT data_json, version, updated_at FROM reading_state WHERE user_id = ?").bind(userId).first<{ data_json: string; version: number; updated_at: string }>();
   try {
     const token = await decryptToken(env, settings.token_ciphertext, settings.token_iv);
     const headers = { Accept: "application/vnd.github+json", Authorization: `Bearer ${token}`, "X-GitHub-Api-Version": API_VERSION };
@@ -185,7 +217,12 @@ async function backupToGitHub(env: ApiEnv, userId: string) {
     let sha: string | undefined;
     if (getResponse.ok) sha = ((await getResponse.json()) as { sha: string }).sha;
     else if (getResponse.status !== 404) throw new Error(`GitHub GET ${getResponse.status}`);
-    const backup = { schemaVersion: 1, updatedAt: state.updated_at, version: state.version, data: JSON.parse(state.data_json) };
+    const backup = {
+      schemaVersion: 2,
+      updatedAt: new Date().toISOString(),
+      tracker: { updatedAt: state.updated_at, version: state.version, data: JSON.parse(state.data_json) },
+      reading: reading ? { updatedAt: reading.updated_at, version: reading.version, data: JSON.parse(reading.data_json) } : { version: 0, data: { current: [], daily: {}, finished: [] } },
+    };
     const putResponse = await fetch(githubEndpoint(settings), {
       method: "PUT",
       headers: { ...headers, "Content-Type": "application/json" },
@@ -291,6 +328,56 @@ async function protectedRoutes(request: Request, env: ApiEnv, ctx: ApiContext, p
     if (!result.meta.changes) return json(request, env, { error: "CONFLICT" }, 409);
     ctx.waitUntil(backupToGitHub(env, user.id).catch(() => undefined));
     return json(request, env, { data, version: nextVersion, updatedAt: now });
+  }
+
+  if (pathname === "/api/reading" && request.method === "GET") {
+    const state = await env.DB.prepare("SELECT data_json, version, updated_at FROM reading_state WHERE user_id = ?").bind(user.id).first<{ data_json: string; version: number; updated_at: string }>();
+    return json(request, env, { data: state ? JSON.parse(state.data_json) : { current: [], daily: {}, finished: [] }, version: state?.version ?? 0, updatedAt: state?.updated_at ?? null });
+  }
+
+  if (pathname === "/api/reading" && request.method === "PUT") {
+    const body = await requestBody(request);
+    const data = body.data ?? { current: [], daily: {}, finished: [] };
+    const baseVersion = Number(body.baseVersion ?? 0);
+    const serialized = JSON.stringify(data);
+    if (serialized.length > 500_000) return json(request, env, { error: "読書記録が保存上限を超えています。" }, 413);
+    const current = await env.DB.prepare("SELECT version, data_json, updated_at FROM reading_state WHERE user_id = ?").bind(user.id).first<{ version: number; data_json: string; updated_at: string }>();
+    if (!current) {
+      if (baseVersion !== 0) return json(request, env, { error: "CONFLICT", data: { current: [], daily: {}, finished: [] }, version: 0, updatedAt: null }, 409);
+      const now = new Date().toISOString();
+      await env.DB.prepare("INSERT INTO reading_state (user_id, data_json, version, updated_at) VALUES (?, ?, 1, ?)").bind(user.id, serialized, now).run();
+      return json(request, env, { data, version: 1, updatedAt: now });
+    }
+    if (current.version !== baseVersion) return json(request, env, { error: "CONFLICT", data: JSON.parse(current.data_json), version: current.version, updatedAt: current.updated_at }, 409);
+    const nextVersion = current.version + 1;
+    const now = new Date().toISOString();
+    const result = await env.DB.prepare("UPDATE reading_state SET data_json = ?, version = ?, updated_at = ? WHERE user_id = ? AND version = ?")
+      .bind(serialized, nextVersion, now, user.id, current.version).run();
+    if (!result.meta.changes) return json(request, env, { error: "CONFLICT" }, 409);
+    return json(request, env, { data, version: nextVersion, updatedAt: now });
+  }
+
+  if (pathname === "/api/books/search" && request.method === "GET") {
+    const query = new URL(request.url).searchParams.get("q")?.trim() ?? "";
+    if (query.length < 2 || query.length > 120) return json(request, env, { error: "本のタイトルを2〜120文字で入力してください。" }, 400);
+    const fields = "key,title,author_name,publisher,number_of_pages_median,cover_i,isbn";
+    const openLibraryUrl = `https://openlibrary.org/search.json?title=${encodeURIComponent(query)}&fields=${encodeURIComponent(fields)}&limit=8&lang=ja`;
+    const ndlUrl = `https://ndlsearch.ndl.go.jp/api/opensearch?cnt=8&title=${encodeURIComponent(query)}`;
+    const [ndlResponse, openLibraryResponse] = await Promise.all([
+      fetch(ndlUrl, { headers: { Accept: "application/xml" } }).catch(() => null),
+      fetch(openLibraryUrl, { headers: { Accept: "application/json", "User-Agent": "HarveyEnglishCareerTracker/1.0" } }).catch(() => null),
+    ]);
+    const ndlBooks = ndlResponse?.ok ? parseNdlBooks(await ndlResponse.text()) : [];
+    const payload = openLibraryResponse?.ok ? await openLibraryResponse.json() as { docs?: Array<{ key?: string; title?: string; author_name?: string[]; publisher?: string[]; number_of_pages_median?: number; cover_i?: number; isbn?: string[] }> } : { docs: [] };
+    const openLibraryBooks = (payload.docs ?? []).filter((item) => item.key && item.title).map((item) => ({
+      id: item.key!, title: item.title!, authors: item.author_name?.slice(0, 4) ?? [], publisher: item.publisher?.[0] ?? null,
+      pageCount: Number.isFinite(item.number_of_pages_median) ? item.number_of_pages_median! : null,
+      coverUrl: item.cover_i ? `https://covers.openlibrary.org/b/id/${item.cover_i}-M.jpg` : null,
+      sourceUrl: `https://openlibrary.org${item.key}`, isbn: item.isbn?.find((value) => value.length === 13) ?? item.isbn?.[0] ?? null,
+    }));
+    const books = [...ndlBooks, ...openLibraryBooks].filter((book, index, all) => index === all.findIndex((candidate) => (book.isbn && candidate.isbn === book.isbn) || candidate.id === book.id)).slice(0, 12);
+    if (!ndlResponse?.ok && !openLibraryResponse?.ok) return json(request, env, { error: "書誌情報を取得できませんでした。時間を置いて再試行してください。" }, 502);
+    return json(request, env, { books, source: ndlBooks.length ? "国立国会図書館サーチ / Open Library" : "Open Library" });
   }
 
   if (pathname === "/api/github/config" && request.method === "GET") {
