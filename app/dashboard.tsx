@@ -3,7 +3,9 @@
 import {
   ChangeEvent,
   CSSProperties,
+  FormEvent,
   ReactNode,
+  useCallback,
   useEffect,
   useMemo,
   useRef,
@@ -30,13 +32,29 @@ import {
   weekStart,
   type PlanTask,
 } from "./plan";
+import { syncApi, type AuthResult, type GitHubSettingsResult } from "./sync-api";
 
 type TrackerStore = {
-  version: 2;
+  version: 3;
   completed: Record<string, boolean>;
   steps: Record<string, number>;
   recoveries: Record<string, string[]>;
   notes: Record<string, string>;
+  modified: Record<string, number>;
+};
+
+type SyncStatus = {
+  state: "off" | "idle" | "syncing" | "success" | "error";
+  message: string;
+  lastSyncAt?: string;
+};
+
+type AuthState = {
+  checking: boolean;
+  authenticated: boolean;
+  setupRequired: boolean;
+  username: string;
+  error: string;
 };
 
 type Metric = { completed: number; total: number; percent: number };
@@ -59,17 +77,85 @@ type IconName =
   | "walk"
   | "plank"
   | "strength"
+  | "cloud"
+  | "shield"
+  | "key"
   | "close";
 
 const STORAGE_KEY = "harvey-english-career-tracker-v2";
+const SESSION_KEY = "harvey-tracker-session-v1";
 
 const emptyStore: TrackerStore = {
-  version: 2,
+  version: 3,
   completed: {},
   steps: {},
   recoveries: {},
   notes: {},
+  modified: {},
 };
+
+function normalizeStore(value?: Partial<TrackerStore> | null): TrackerStore {
+  return {
+    version: 3,
+    completed: value?.completed ?? {},
+    steps: value?.steps ?? {},
+    recoveries: value?.recoveries ?? {},
+    notes: value?.notes ?? {},
+    modified: value?.modified ?? {},
+  };
+}
+
+function stampStore(value: Partial<TrackerStore>) {
+  const store = normalizeStore(value);
+  const now = Date.now();
+  const modified = { ...store.modified };
+  Object.keys(store.completed).forEach((key) => { modified[`completed:${key}`] = now; });
+  Object.keys(store.steps).forEach((key) => { modified[`steps:${key}`] = now; });
+  Object.keys(store.recoveries).forEach((key) => { modified[`recoveries:${key}`] = now; });
+  Object.keys(store.notes).forEach((key) => { modified[`notes:${key}`] = now; });
+  return { ...store, modified };
+}
+
+function mergeRecord<T>(
+  prefix: string,
+  local: Record<string, T>,
+  remote: Record<string, T>,
+  localModified: Record<string, number>,
+  remoteModified: Record<string, number>,
+  resolveLegacy: (localValue: T | undefined, remoteValue: T | undefined) => T | undefined,
+) {
+  const merged: Record<string, T> = {};
+  const keys = new Set([...Object.keys(local), ...Object.keys(remote)]);
+  keys.forEach((key) => {
+    const localTime = localModified[`${prefix}:${key}`] ?? 0;
+    const remoteTime = remoteModified[`${prefix}:${key}`] ?? 0;
+    const value = localTime > remoteTime
+      ? local[key]
+      : remoteTime > localTime
+        ? remote[key]
+        : resolveLegacy(local[key], remote[key]);
+    if (value !== undefined) merged[key] = value;
+  });
+  return merged;
+}
+
+function mergeStores(localValue: Partial<TrackerStore>, remoteValue: Partial<TrackerStore>) {
+  const local = normalizeStore(localValue);
+  const remote = normalizeStore(remoteValue);
+  const modified: Record<string, number> = {};
+  new Set([...Object.keys(local.modified), ...Object.keys(remote.modified)]).forEach((key) => {
+    modified[key] = Math.max(local.modified[key] ?? 0, remote.modified[key] ?? 0);
+  });
+  return {
+    version: 3 as const,
+    completed: mergeRecord("completed", local.completed, remote.completed, local.modified, remote.modified, (a, b) => Boolean(a || b)),
+    steps: mergeRecord("steps", local.steps, remote.steps, local.modified, remote.modified, (a, b) => Math.max(a ?? 0, b ?? 0)),
+    recoveries: mergeRecord("recoveries", local.recoveries, remote.recoveries, local.modified, remote.modified, (a, b) => Array.from(new Set([...(a ?? []), ...(b ?? [])]))),
+    notes: mergeRecord("notes", local.notes, remote.notes, local.modified, remote.modified, (a, b) => b ?? a ?? ""),
+    modified,
+  } satisfies TrackerStore;
+}
+
 
 const navItems: { id: string; label: string; icon: IconName }[] = [
   { id: "dashboard", label: "ダッシュボード", icon: "grid" },
@@ -102,6 +188,9 @@ function Icon({ name, size = 20 }: { name: IconName; size?: number }) {
     walk: <><path d="M13 5a2 2 0 1 0 0-4 2 2 0 0 0 0 4ZM10 7l3-1 3 3 3 1M13 6l-2 6-4 3M11 12l4 3 1 5M7 15l-3 5" /></>,
     plank: <><circle cx="19" cy="8" r="2" /><path d="M3 17h18M6 16l2-5 6 1 3-3M8 11l-3 2" /></>,
     strength: <><path d="M3 10v4M6 8v8M9 11h6M18 8v8M21 10v4" /></>,
+    cloud: <><path d="M17.5 19H6a4 4 0 0 1-.5-8A6.5 6.5 0 0 1 18 9.5 4.8 4.8 0 0 1 17.5 19Z" /><path d="m9 14 3-3 3 3M12 11v7" /></>,
+    shield: <><path d="M12 22s8-3.5 8-10V5l-8-3-8 3v7c0 6.5 8 10 8 10Z" /><path d="m9 12 2 2 4-5" /></>,
+    key: <><circle cx="8" cy="15" r="4" /><path d="m11 12 9-9M15 8l3 3M17 6l2 2" /></>,
     close: <><path d="m6 6 12 12M18 6 6 18" /></>,
   };
   return (
@@ -137,8 +226,8 @@ function StatusPill({ children, tone = "neutral" }: { children: ReactNode; tone?
   return <span className={`status-pill ${tone}`}>{children}</span>;
 }
 
-function AppButton({ children, icon, onClick, variant = "secondary", disabled = false }: { children: ReactNode; icon?: IconName; onClick?: () => void; variant?: "primary" | "secondary" | "ghost" | "danger"; disabled?: boolean }) {
-  return <button type="button" className={`app-button ${variant}`} onClick={onClick} disabled={disabled}>{icon && <Icon name={icon} size={17} />}{children}</button>;
+function AppButton({ children, icon, onClick, variant = "secondary", disabled = false, type = "button" }: { children: ReactNode; icon?: IconName; onClick?: () => void; variant?: "primary" | "secondary" | "ghost" | "danger"; disabled?: boolean; type?: "button" | "submit" }) {
+  return <button type={type} className={`app-button ${variant}`} onClick={onClick} disabled={disabled}>{icon && <Icon name={icon} size={17} />}{children}</button>;
 }
 
 export default function Dashboard() {
@@ -151,21 +240,22 @@ export default function Dashboard() {
   const [dataModal, setDataModal] = useState(false);
   const [toast, setToast] = useState("");
   const [showAllRecovery, setShowAllRecovery] = useState(false);
+  const [auth, setAuth] = useState<AuthState>({ checking: true, authenticated: false, setupRequired: false, username: "", error: "" });
+  const [sessionToken, setSessionToken] = useState("");
+  const [cloudVersion, setCloudVersion] = useState(0);
+  const [syncStatus, setSyncStatus] = useState<SyncStatus>({ state: "off", message: "ログイン待ち" });
+  const [githubSettings, setGithubSettings] = useState<GitHubSettingsResult | null>(null);
+  const [showToken, setShowToken] = useState(false);
   const fileRef = useRef<HTMLInputElement>(null);
+  const syncLock = useRef(false);
+  const lastSyncedFingerprint = useRef("");
 
   useEffect(() => {
     const frame = window.requestAnimationFrame(() => {
       try {
         const raw = window.localStorage.getItem(STORAGE_KEY);
         if (raw) {
-          const parsed = JSON.parse(raw) as Partial<TrackerStore>;
-          setStore({
-            version: 2,
-            completed: parsed.completed ?? {},
-            steps: parsed.steps ?? {},
-            recoveries: parsed.recoveries ?? {},
-            notes: parsed.notes ?? {},
-          });
+          setStore(normalizeStore(JSON.parse(raw) as Partial<TrackerStore>));
         }
       } catch {
         setToast("保存データを読み込めませんでした。新しい記録として開始します。");
@@ -185,6 +275,134 @@ export default function Dashboard() {
     const timer = window.setTimeout(() => setToast(""), 2800);
     return () => window.clearTimeout(timer);
   }, [toast]);
+
+  const loadCloud = useCallback(async (token: string, local: TrackerStore) => {
+    const [identity, remote, settings] = await Promise.all([
+      syncApi.me(token),
+      syncApi.getData<TrackerStore>(token),
+      syncApi.getGitHubSettings(token),
+    ]);
+    const normalizedRemote = normalizeStore(remote.data);
+    const merged = mergeStores(local, normalizedRemote);
+    setSessionToken(token);
+    setCloudVersion(remote.version);
+    setGithubSettings(settings);
+    setStore(merged);
+    lastSyncedFingerprint.current = JSON.stringify(normalizedRemote);
+    setAuth({ checking: false, authenticated: true, setupRequired: false, username: identity.user.username, error: "" });
+    setSyncStatus({ state: "success", message: "クラウド同期済み", lastSyncAt: new Date().toISOString() });
+  }, [setAuth, setCloudVersion, setGithubSettings, setSessionToken, setStore, setSyncStatus]);
+
+  useEffect(() => {
+    if (!hydrated) return;
+    let cancelled = false;
+    const restoreSession = async () => {
+      const token = window.localStorage.getItem(SESSION_KEY) ?? "";
+      try {
+        if (token) {
+          await loadCloud(token, store);
+          return;
+        }
+        const status = await syncApi.status();
+        if (!cancelled) setAuth({ checking: false, authenticated: false, setupRequired: status.setupRequired, username: "", error: "" });
+      } catch (error) {
+        const status = (error as Error & { status?: number }).status;
+        if (status === 401) window.localStorage.removeItem(SESSION_KEY);
+        try {
+          const setup = await syncApi.status();
+          if (!cancelled) setAuth({ checking: false, authenticated: false, setupRequired: setup.setupRequired, username: "", error: status === 401 ? "セッションの期限が切れました。もう一度ログインしてください。" : "" });
+        } catch {
+          if (!cancelled) setAuth({ checking: false, authenticated: false, setupRequired: false, username: "", error: "同期サーバーに接続できません。通信環境を確認して再試行してください。" });
+        }
+      }
+    };
+    void restoreSession();
+    return () => { cancelled = true; };
+  // Initial local store must be captured once after hydration.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [hydrated, loadCloud]);
+
+  const uploadCloud = useCallback(async (force = false) => {
+    if (!sessionToken || !auth.authenticated || syncLock.current) return;
+    const fingerprint = JSON.stringify(store);
+    if (!force && fingerprint === lastSyncedFingerprint.current) return;
+    syncLock.current = true;
+    setSyncStatus({ state: "syncing", message: "保存中…" });
+    try {
+      let candidate = store;
+      let baseVersion = cloudVersion;
+      try {
+        const saved = await syncApi.putData<TrackerStore>(sessionToken, candidate, baseVersion);
+        baseVersion = saved.version;
+        candidate = normalizeStore(saved.data);
+      } catch (error) {
+        const conflict = error as Error & { status?: number; payload?: { data?: TrackerStore; version?: number } };
+        if (conflict.status !== 409 || !conflict.payload) throw error;
+        candidate = mergeStores(candidate, conflict.payload.data ?? emptyStore);
+        const saved = await syncApi.putData<TrackerStore>(sessionToken, candidate, conflict.payload.version ?? 0);
+        baseVersion = saved.version;
+        candidate = normalizeStore(saved.data);
+        setStore(candidate);
+      }
+      setCloudVersion(baseVersion);
+      lastSyncedFingerprint.current = JSON.stringify(candidate);
+      setSyncStatus({ state: "success", message: "クラウド同期済み", lastSyncAt: new Date().toISOString() });
+    } catch (error) {
+      if ((error as Error & { status?: number }).status === 401) {
+        window.localStorage.removeItem(SESSION_KEY);
+        setSessionToken("");
+        setAuth((current) => ({ ...current, authenticated: false, error: "セッションの期限が切れました。再度ログインしてください。" }));
+      }
+      setSyncStatus({ state: "error", message: "未同期の変更があります" });
+    } finally {
+      syncLock.current = false;
+    }
+  }, [auth.authenticated, cloudVersion, sessionToken, store]);
+
+  useEffect(() => {
+    if (!hydrated || !auth.authenticated) return;
+    const timer = window.setTimeout(() => void uploadCloud(), 1800);
+    return () => window.clearTimeout(timer);
+  }, [store, hydrated, auth.authenticated, uploadCloud]);
+
+  const pullCloud = useCallback(async () => {
+    if (!sessionToken || !auth.authenticated || syncLock.current) return;
+    try {
+      const remote = await syncApi.getData<TrackerStore>(sessionToken);
+      const normalizedRemote = normalizeStore(remote.data);
+      const merged = mergeStores(store, normalizedRemote);
+      setCloudVersion(remote.version);
+      lastSyncedFingerprint.current = JSON.stringify(normalizedRemote);
+      if (JSON.stringify(merged) !== JSON.stringify(store)) setStore(merged);
+      setSyncStatus({ state: "success", message: "クラウド同期済み", lastSyncAt: new Date().toISOString() });
+    } catch {
+      setSyncStatus({ state: "error", message: "同期を再試行してください" });
+    }
+  }, [auth.authenticated, sessionToken, store]);
+
+  useEffect(() => {
+    if (!auth.authenticated) return;
+    const onFocus = () => void pullCloud();
+    const onVisibility = () => { if (document.visibilityState === "visible") void pullCloud(); };
+    window.addEventListener("focus", onFocus);
+    document.addEventListener("visibilitychange", onVisibility);
+    const interval = window.setInterval(onFocus, 60_000);
+    return () => { window.removeEventListener("focus", onFocus); document.removeEventListener("visibilitychange", onVisibility); window.clearInterval(interval); };
+  }, [auth.authenticated, pullCloud]);
+
+  async function completeAuthentication(result: AuthResult) {
+    window.localStorage.setItem(SESSION_KEY, result.token);
+    await loadCloud(result.token, store);
+  }
+
+  async function logout() {
+    if (sessionToken) await syncApi.logout(sessionToken).catch(() => undefined);
+    window.localStorage.removeItem(SESSION_KEY);
+    setSessionToken("");
+    const status = await syncApi.status().catch(() => ({ setupRequired: false }));
+    setAuth({ checking: false, authenticated: false, setupRequired: status.setupRequired, username: "", error: "ログアウトしました。" });
+    setSyncStatus({ state: "off", message: "ログイン待ち" });
+  }
 
   const phase = planMonthFor(selectedDate);
   const hanon = phaseForDate(selectedDate);
@@ -253,19 +471,20 @@ export default function Dashboard() {
     setStore((current) => ({
       ...current,
       completed: { ...current.completed, [key]: !current.completed[key] },
+      modified: { ...current.modified, [`completed:${key}`]: Date.now() },
     }));
   }
 
   function setStep(iso: string, value: string) {
     const next = Math.min(200_000, Math.max(0, Number(value.replace(/[^0-9]/g, "")) || 0));
-    setStore((current) => ({ ...current, steps: { ...current.steps, [iso]: next } }));
+    setStore((current) => ({ ...current, steps: { ...current.steps, [iso]: next }, modified: { ...current.modified, [`steps:${iso}`]: Date.now() } }));
   }
 
   function addRecovery(task: PlanTask) {
     setStore((current) => {
       const assigned = current.recoveries[selectedDate] ?? [];
       if (assigned.includes(task.key)) return current;
-      return { ...current, recoveries: { ...current.recoveries, [selectedDate]: [...assigned, task.key] } };
+      return { ...current, recoveries: { ...current.recoveries, [selectedDate]: [...assigned, task.key] }, modified: { ...current.modified, [`recoveries:${selectedDate}`]: Date.now() } };
     });
     setToast("今日のタスクにリカバリーを追加しました");
   }
@@ -274,6 +493,7 @@ export default function Dashboard() {
     setStore((current) => ({
       ...current,
       recoveries: { ...current.recoveries, [selectedDate]: (current.recoveries[selectedDate] ?? []).filter((key) => key !== taskKey) },
+      modified: { ...current.modified, [`recoveries:${selectedDate}`]: Date.now() },
     }));
   }
 
@@ -304,7 +524,7 @@ export default function Dashboard() {
     try {
       const payload = JSON.parse(await file.text());
       const data = (payload.data ?? payload) as Partial<TrackerStore>;
-      setStore({ version: 2, completed: data.completed ?? {}, steps: data.steps ?? {}, recoveries: data.recoveries ?? {}, notes: data.notes ?? {} });
+      setStore(stampStore(data));
       setToast("バックアップを復元しました");
       setDataModal(false);
     } catch {
@@ -331,6 +551,10 @@ export default function Dashboard() {
   const planMarker = Math.min(100, Math.max(0, timePercent));
   const dailyMinutes = selectedTasks.reduce((sum, task) => sum + task.minutes, 0);
 
+  if (!hydrated || auth.checking || !auth.authenticated) {
+    return <AuthScreen auth={auth} onLogin={async (username, password) => completeAuthentication(await syncApi.login(username, password))} onRegister={async (username, password, setupCode) => completeAuthentication(await syncApi.register(username, password, setupCode))} onRetry={() => window.location.reload()} />;
+  }
+
   return (
     <div className="app-shell">
       <aside className="sidebar" aria-label="メインナビゲーション">
@@ -339,7 +563,7 @@ export default function Dashboard() {
           {navItems.map((item) => <button key={item.id} type="button" className={activeSection === item.id ? "active" : ""} onClick={() => goToSection(item.id)}><Icon name={item.icon} /><span>{item.label}</span></button>)}
         </nav>
         <div className="sidebar-goal"><span>最終目標</span><strong>C1 / EXECUTIVE</strong><small>18ヶ月後の自分へ</small><button type="button" onClick={() => goToSection("resources")}>目標を確認 <Icon name="arrow" size={16} /></button></div>
-        <div className="profile"><span className="avatar">H</span><span><strong>Harvey</strong><small>端末内に自動保存</small></span><button type="button" aria-label="データ管理を開く" onClick={() => setDataModal(true)}><Icon name="arrow" size={17} /></button></div>
+        <div className="profile"><span className="avatar">H</span><span><strong>{auth.username}</strong><small>クラウド同期済み</small></span><button type="button" aria-label="データ管理を開く" onClick={() => setDataModal(true)}><Icon name="arrow" size={17} /></button></div>
       </aside>
 
       <main className="main-content" id="dashboard">
@@ -352,6 +576,7 @@ export default function Dashboard() {
             <button type="button" aria-label="翌日" onClick={() => changeDate(addDays(selectedDate, 1))}>›</button>
           </div>
           <div className="top-actions">
+            <button type="button" className={`sync-chip ${syncStatus.state}`} onClick={() => void uploadCloud(true)} title={syncStatus.message}><Icon name="cloud" size={17} /><span>{syncStatus.message}</span></button>
             <button className="notification" type="button" aria-label={`${recoveryQueue.length}件の未実施`} onClick={() => goToSection("recovery")}><Icon name="bell" /><span>{Math.min(99, recoveryQueue.length)}</span></button>
             <AppButton icon="copy" onClick={copyReport}>進捗をコピー</AppButton>
             <AppButton icon="edit" variant="primary" onClick={() => document.getElementById("daily-note")?.focus()}>今日の記録</AppButton>
@@ -386,7 +611,7 @@ export default function Dashboard() {
             <div className="task-list">
               {selectedTasks.map((task) => <TaskRow key={task.key} task={task} checked={Boolean(store.completed[task.key])} onToggle={() => toggleCompletion(task.key)} />)}
             </div>
-            <label className="daily-note"><span>今日のひと言メモ</span><textarea id="daily-note" value={store.notes[selectedDate] ?? ""} placeholder="できたこと、詰まった点、明日の一手…" onChange={(event) => setStore((current) => ({ ...current, notes: { ...current.notes, [selectedDate]: event.target.value } }))} /></label>
+            <label className="daily-note"><span>今日のひと言メモ</span><textarea id="daily-note" value={store.notes[selectedDate] ?? ""} placeholder="できたこと、詰まった点、明日の一手…" onChange={(event) => setStore((current) => ({ ...current, notes: { ...current.notes, [selectedDate]: event.target.value }, modified: { ...current.modified, [`notes:${selectedDate}`]: Date.now() } }))} /></label>
           </section>
 
           <aside className="right-column">
@@ -450,11 +675,89 @@ export default function Dashboard() {
         {[navItems[0], navItems[2], navItems[3], navItems[5], navItems[6]].map((item) => <button key={item.id} type="button" className={activeSection === item.id ? "active" : ""} onClick={() => goToSection(item.id)}><Icon name={item.icon} /><span>{item.label.replace("トラッカー", "").replace("レポート", "")}</span></button>)}
       </nav>
 
-      {dataModal && <div className="modal-backdrop" role="presentation" onMouseDown={() => setDataModal(false)}><section className="data-modal" role="dialog" aria-modal="true" aria-labelledby="data-modal-title" onMouseDown={(event) => event.stopPropagation()}><button className="modal-close" type="button" aria-label="閉じる" onClick={() => setDataModal(false)}><Icon name="close" /></button><span className="eyebrow">DATA & BACKUP</span><h2 id="data-modal-title">記録データの管理</h2><p>チェック・歩数・メモはこのブラウザ内に自動保存されます。MacとiPhone間で移す場合は、JSONを書き出してもう一方の端末で読み込んでください。</p><div className="modal-actions"><AppButton icon="download" variant="primary" onClick={exportData}>バックアップを書き出す</AppButton><AppButton icon="upload" onClick={() => fileRef.current?.click()}>バックアップを読み込む</AppButton><input ref={fileRef} type="file" accept="application/json,.json" onChange={importData} hidden /><AppButton icon="copy" variant="ghost" onClick={copyReport}>進捗サマリーをコピー</AppButton></div><div className="sync-note"><strong>Mac ↔ iPhoneの自動同期について</strong><p>GitHub Pagesだけでは個人データを安全に同期できません。現在は端末内保存＋バックアップ方式です。将来、認証付きクラウド保存を接続できる構造にしています。</p></div></section></div>}
+      {dataModal && <div className="modal-backdrop" role="presentation" onMouseDown={() => setDataModal(false)}><section className="data-modal" role="dialog" aria-modal="true" aria-labelledby="data-modal-title" onMouseDown={(event) => event.stopPropagation()}><button className="modal-close" type="button" aria-label="閉じる" onClick={() => setDataModal(false)}><Icon name="close" /></button><span className="eyebrow">DATA VAULT</span><h2 id="data-modal-title">記録データの管理</h2><p>記録はログイン中のクラウドへ自動保存され、Mac・Windows・iPhoneで同じ最新データを利用できます。ブラウザ内にも復旧用キャッシュを保持します。</p><div className="cloud-summary"><Icon name="shield" /><div><strong>{auth.username} として保護中</strong><span>{syncStatus.message}{syncStatus.lastSyncAt ? `・${new Date(syncStatus.lastSyncAt).toLocaleTimeString("ja-JP", { hour: "2-digit", minute: "2-digit" })}` : ""}</span></div><AppButton icon="cloud" onClick={() => void uploadCloud(true)}>今すぐ同期</AppButton></div><GitHubBackupPanel token={sessionToken} initial={githubSettings} showToken={showToken} onToggleToken={() => setShowToken((value) => !value)} onUpdated={async () => setGithubSettings(await syncApi.getGitHubSettings(sessionToken))} onToast={setToast} /><div className="local-backup"><strong>手元にもバックアップ</strong><p>JSONは緊急時の持ち出し・復元用です。読み込んだ内容はクラウドにも反映されます。</p><div className="modal-actions"><AppButton icon="download" variant="primary" onClick={exportData}>JSONを書き出す</AppButton><AppButton icon="upload" onClick={() => fileRef.current?.click()}>JSONを読み込む</AppButton><input ref={fileRef} type="file" accept="application/json,.json" onChange={importData} hidden /><AppButton icon="copy" variant="ghost" onClick={copyReport}>進捗サマリーをコピー</AppButton></div></div><button className="logout-button" type="button" onClick={() => void logout()}>この端末からログアウト</button></section></div>}
 
       {toast && <div className="toast" role="status" aria-live="polite">{toast}</div>}
     </div>
   );
+}
+
+function AuthScreen({ auth, onLogin, onRegister, onRetry }: { auth: AuthState; onLogin: (username: string, password: string) => Promise<void>; onRegister: (username: string, password: string, setupCode: string) => Promise<void>; onRetry: () => void }) {
+  const [username, setUsername] = useState("");
+  const [password, setPassword] = useState("");
+  const [confirm, setConfirm] = useState("");
+  const [setupCode, setSetupCode] = useState("");
+  const [visible, setVisible] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+
+  async function submit(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (auth.setupRequired && password !== confirm) { setError("確認用パスワードが一致しません。"); return; }
+    setBusy(true);
+    setError("");
+    try {
+      if (auth.setupRequired) await onRegister(username, password, setupCode);
+      else await onLogin(username, password);
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "認証に失敗しました。");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return <main className="auth-shell">
+    <section className="auth-editorial">
+      <div className="auth-brand"><strong>Harvey</strong><span>PRIVATE<br />PROGRESS VAULT</span></div>
+      <div className="auth-number">18</div>
+      <div className="auth-manifest"><span>MONTHS TO EXECUTIVE ENGLISH</span><h1>約束を、<br />毎日の証拠に。</h1><p>学習・資格・健康習慣をひとつの安全な場所へ。どの端末からでも、続きから。</p></div>
+      <ul><li><Icon name="cloud" />端末間で自動同期</li><li><Icon name="shield" />パスワードはハッシュ化</li><li><Icon name="key" />GitHubパスワード不使用</li></ul>
+    </section>
+    <section className="auth-panel">
+      <form className="auth-card" onSubmit={submit}>
+        <span className="eyebrow">{auth.setupRequired ? "OWNER REGISTRATION" : "SECURE SIGN IN"}</span>
+        <h2>{auth.checking ? "接続を確認中" : auth.setupRequired ? "専用アカウントを作成" : "おかえりなさい"}</h2>
+        <p>{auth.setupRequired ? "この登録は最初の1回だけです。以後は作成したアカウントでログインできます。" : "このサイト専用のアカウント名とパスワードを入力してください。"}</p>
+        {auth.checking ? <div className="auth-loading"><i /><span>暗号化された保管庫へ接続しています…</span></div> : <>
+          <label className="auth-field"><span>アカウント名</span><input autoComplete="username" value={username} onChange={(event) => setUsername(event.target.value)} placeholder="harvey" required minLength={3} /></label>
+          <label className="auth-field"><span>パスワード</span><div className="password-field"><input type={visible ? "text" : "password"} autoComplete={auth.setupRequired ? "new-password" : "current-password"} value={password} onChange={(event) => setPassword(event.target.value)} placeholder="12文字以上" required minLength={12} /><button type="button" onClick={() => setVisible((value) => !value)}>{visible ? "隠す" : "表示"}</button></div>{auth.setupRequired && <small>大文字・小文字・数字を含む12文字以上</small>}</label>
+          {auth.setupRequired && <><label className="auth-field"><span>パスワード（確認）</span><input type={visible ? "text" : "password"} autoComplete="new-password" value={confirm} onChange={(event) => setConfirm(event.target.value)} required minLength={12} /></label><label className="auth-field"><span>初回セットアップコード</span><input value={setupCode} onChange={(event) => setSetupCode(event.target.value)} placeholder="別途発行されたコード" required /></label></>}
+          {(error || auth.error) && <div className="auth-error" role="alert">{error || auth.error}</div>}
+          <button className="auth-submit" type="submit" disabled={busy}>{busy ? "確認しています…" : auth.setupRequired ? "保管庫を作成" : "ログイン"}<Icon name="arrow" /></button>
+          {auth.error.includes("接続できません") && <button className="auth-retry" type="button" onClick={onRetry}>接続を再試行</button>}
+          <small className="auth-footnote"><Icon name="shield" size={15} />GitHubのアカウント／パスワードは入力しません</small>
+        </>}
+      </form>
+    </section>
+  </main>;
+}
+
+function GitHubBackupPanel({ token, initial, showToken, onToggleToken, onUpdated, onToast }: { token: string; initial: GitHubSettingsResult | null; showToken: boolean; onToggleToken: () => void; onUpdated: () => Promise<void>; onToast: (message: string) => void }) {
+  const current = initial?.settings;
+  const [owner, setOwner] = useState(current?.owner ?? "harvey-shimizu");
+  const [repo, setRepo] = useState(current?.repo ?? "harvey-tracker-data");
+  const [branch, setBranch] = useState(current?.branch ?? "main");
+  const [path, setPath] = useState(current?.path ?? "data/progress.json");
+  const [githubToken, setGithubToken] = useState("");
+  const [busy, setBusy] = useState(false);
+
+  async function save(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault(); setBusy(true);
+    try {
+      await syncApi.saveGitHubSettings(token, { owner, repo, branch, path, ...(githubToken ? { token: githubToken } : {}) });
+      setGithubToken(""); await onUpdated(); onToast("GitHubバックアップを設定しました");
+    } catch (error) { onToast(error instanceof Error ? error.message : "GitHub設定を保存できませんでした"); }
+    finally { setBusy(false); }
+  }
+
+  async function backup() {
+    setBusy(true);
+    try { await syncApi.backupNow(token); await onUpdated(); onToast("GitHubへバックアップしました"); }
+    catch (error) { onToast(error instanceof Error ? error.message : "バックアップに失敗しました"); }
+    finally { setBusy(false); }
+  }
+
+  return <form className="github-backup" onSubmit={save}><div className="github-heading"><div><span className="eyebrow">OPTIONAL DOUBLE BACKUP</span><strong>GitHubにも暗号化キー経由で保存</strong><small>{initial?.configured ? current?.last_backup_error ? `要確認：${current.last_backup_error}` : current?.last_backup_at ? `最終バックアップ ${new Date(current.last_backup_at).toLocaleString("ja-JP")}` : "設定済み・初回保存待ち" : "未設定"}</small></div><StatusPill tone={initial?.configured && !current?.last_backup_error ? "green" : "neutral"}>{initial?.configured ? "CONNECTED" : "OPTIONAL"}</StatusPill></div><div className="github-grid"><label><span>OWNER</span><input value={owner} onChange={(event) => setOwner(event.target.value)} required /></label><label><span>PRIVATE REPOSITORY</span><input value={repo} onChange={(event) => setRepo(event.target.value)} required /></label><label><span>BRANCH</span><input value={branch} onChange={(event) => setBranch(event.target.value)} required /></label><label><span>FILE PATH</span><input value={path} onChange={(event) => setPath(event.target.value)} required /></label></div><label className="github-token"><span>Fine-grained access token {initial?.configured && "（変更時のみ）"}</span><div><input type={showToken ? "text" : "password"} value={githubToken} onChange={(event) => setGithubToken(event.target.value)} placeholder={initial?.configured ? "保存済み" : "github_pat_…"} required={!initial?.configured} /><button type="button" onClick={onToggleToken}>{showToken ? "隠す" : "表示"}</button></div><small>専用の非公開リポジトリに対する Contents: Read and write のみを付与。保存キーはサーバー側で暗号化します。</small></label><div className="github-actions"><AppButton icon="key" variant="primary" type="submit" disabled={busy}>{busy ? "処理中…" : "設定を保存"}</AppButton>{initial?.configured && <AppButton icon="cloud" onClick={() => void backup()} disabled={busy}>今すぐGitHubへ保存</AppButton>}</div></form>;
 }
 
 function TaskRow({ task, checked, onToggle, recovered = false, onRemove }: { task: PlanTask; checked: boolean; onToggle: () => void; recovered?: boolean; onRemove?: () => void }) {
