@@ -21,9 +21,9 @@ type GitHubRow = {
   last_backup_error: string | null;
 };
 
-// Sites Workers have a bounded CPU budget. 120k PBKDF2 rounds keeps password
-// verification deliberately expensive without exceeding that runtime budget.
-const PASSWORD_ITERATIONS = 120_000;
+// 0 identifies the server-peppered HMAC-SHA256 verifier. The pepper never
+// leaves the Worker environment, so a database copy alone cannot test guesses.
+const PASSWORD_ITERATIONS = 0;
 const SESSION_DAYS = 30;
 const API_VERSION = "2026-03-10";
 
@@ -80,10 +80,21 @@ async function sha256(value: string) {
   return base64Url(new Uint8Array(digest));
 }
 
-async function passwordHash(password: string, salt: Uint8Array, iterations = PASSWORD_ITERATIONS) {
-  const material = await crypto.subtle.importKey("raw", new TextEncoder().encode(password), "PBKDF2", false, ["deriveBits"]);
-  const bits = await crypto.subtle.deriveBits({ name: "PBKDF2", hash: "SHA-256", salt, iterations }, material, 256);
-  return base64Url(new Uint8Array(bits));
+async function passwordHash(env: ApiEnv, password: string, salt: Uint8Array, iterations = PASSWORD_ITERATIONS) {
+  if (iterations > 0) {
+    const material = await crypto.subtle.importKey("raw", new TextEncoder().encode(password), "PBKDF2", false, ["deriveBits"]);
+    const bits = await crypto.subtle.deriveBits({ name: "PBKDF2", hash: "SHA-256", salt, iterations }, material, 256);
+    return base64Url(new Uint8Array(bits));
+  }
+  const pepper = fromBase64(env.TOKEN_ENCRYPTION_KEY);
+  const key = await crypto.subtle.importKey("raw", pepper, { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+  const passwordBytes = new TextEncoder().encode(password);
+  const message = new Uint8Array(salt.length + 1 + passwordBytes.length);
+  message.set(salt, 0);
+  message[salt.length] = 0;
+  message.set(passwordBytes, salt.length + 1);
+  const signature = await crypto.subtle.sign("HMAC", key, message);
+  return base64Url(new Uint8Array(signature));
 }
 
 function safeEqual(left: string, right: string) {
@@ -215,7 +226,7 @@ async function authRoutes(request: Request, env: ApiEnv, pathname: string) {
       const salt = crypto.getRandomValues(new Uint8Array(16));
       const userId = crypto.randomUUID();
       const now = new Date().toISOString();
-      const hash = await passwordHash(password, salt);
+      const hash = await passwordHash(env, password, salt);
       stage = "database";
       await env.DB.batch([
         env.DB.prepare("INSERT INTO users (id, username, username_normalized, password_hash, password_salt, password_iterations, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)")
@@ -236,7 +247,7 @@ async function authRoutes(request: Request, env: ApiEnv, pathname: string) {
     const username = String(body.username ?? "").trim().toLowerCase();
     const password = String(body.password ?? "");
     const row = await env.DB.prepare("SELECT * FROM users WHERE username_normalized = ?").bind(username).first<{ id: string; username: string; password_hash: string; password_salt: string; password_iterations: number }>();
-    const candidate = row ? await passwordHash(password, fromBase64(row.password_salt), row.password_iterations) : await passwordHash(password, crypto.getRandomValues(new Uint8Array(16)));
+    const candidate = row ? await passwordHash(env, password, fromBase64(row.password_salt), row.password_iterations) : await passwordHash(env, password, crypto.getRandomValues(new Uint8Array(16)));
     if (!row || !safeEqual(candidate, row.password_hash)) return json(request, env, { error: "アカウント名またはパスワードが正しくありません。" }, 401);
     await env.DB.prepare("DELETE FROM sessions WHERE expires_at <= ?").bind(new Date().toISOString()).run();
     const session = await createSession(env, row.id);
@@ -329,7 +340,10 @@ export async function handleApi(request: Request, env: ApiEnv, ctx: ApiContext):
   if (!url.pathname.startsWith("/api/")) return null;
   if (!allowedOrigin(request, env)) return json(request, env, { error: "このアクセス元は許可されていません。" }, 403);
   if (request.method === "OPTIONS") return new Response(null, { status: 204, headers: corsHeaders(request, env) });
-  if (url.pathname === "/api/health") return json(request, env, { ok: true });
+  if (url.pathname === "/api/health") {
+    await passwordHash(env, "health-check", new Uint8Array(16));
+    return json(request, env, { ok: true, passwordVerifier: "ready" });
+  }
   try {
     const authResponse = await authRoutes(request, env, url.pathname);
     if (authResponse) return authResponse;
