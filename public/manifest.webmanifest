@@ -1,0 +1,17 @@
+{
+  "name": "Harvey English Career Tracker",
+  "short_name": "Harvey Tracker",
+  "description": "18か月の英語学習・資格・健康習慣トラッカー",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#f3efe6",
+  "theme_color": "#f3efe6",
+  "icons": [
+    {
+      "src": "/favicon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}
